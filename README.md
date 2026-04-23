@@ -1,6 +1,8 @@
 # ⚽ FIFA FeatureScope
 
-A feature selection practice project built on the FIFA 22 player dataset. The pipeline demonstrates all 5 core feature selection techniques to predict player position from player attributes.
+A feature selection + modeling practice project built on the FIFA 22 player dataset. The pipeline demonstrates all 5 core feature selection techniques, followed by XGBoost and LightGBM classification to predict player position from player attributes.
+
+> 📄 For full pipeline and modeling details, see [FIFA_FeatureScope_Pipeline.md](FIFA_FeatureScope_Pipeline.md)
 
 ---
 
@@ -40,6 +42,33 @@ movement_balance, power_jumping, mentality_aggression, mentality_penalties
 
 ---
 
+## 🤖 Modeling Phase
+
+The 20 selected features were used to train and compare XGBoost and LightGBM classifiers. A stratified 80/20 train/test split was used due to the multiclass imbalance problem.
+
+**Primary metric: Macro F1** (not accuracy) — because classes like CF (26 samples) and RWB (34 samples) are heavily underrepresented compared to CB (628) and ST (472). Accuracy is dominated by majority classes and is misleading here.
+
+### Experiments & Results
+
+| Run | Accuracy | Macro F1 | Notes |
+|---|---|---|---|
+| XGBoost Baseline | 0.688 | 0.44 | CF / LWB / RWB completely ignored |
+| XGBoost + SMOTE | 0.651 | 0.45 | Minority classes recognized |
+| XGBoost + SMOTE + Tuning | 0.668 | 0.45 | Marginal gain from RandomizedSearchCV |
+| LightGBM + class_weight | 0.664 | **0.46** | Best — clean approach |
+| LightGBM + SMOTE (leaky) | 0.667 | 0.45 | CV inflated to 0.91 — not trustworthy |
+| LightGBM + SMOTE Pipeline | 0.663 | **0.46** | Best — correct approach |
+
+### Key Findings
+
+- **LightGBM** slightly outperforms XGBoost on this dataset (0.46 vs 0.45 Macro F1)
+- **SMOTE must be applied inside the CV loop** using `imblearn.Pipeline` — applying it before CV causes data leakage, inflating CV scores from 0.46 to 0.91
+- **`class_weight='balanced'`** and **SMOTE Pipeline** achieve the same result through different mechanisms — both correct, both honest
+- **Data ceiling reached at 0.46 Macro F1** — CF, LWB, RWB don't have enough samples for any technique to fully fix
+- Confusion matrix showed systematic positional confusion: LWB↔LB, RWB↔RB, LW↔LM↔RM↔RW — tactically similar positions are naturally hard to distinguish
+
+---
+
 ## 🚀 Streamlit App
 
 > 🔧 **Coming soon** — 5-page interactive app, one page per feature selection method.
@@ -60,6 +89,8 @@ Planned pages:
 - Python 3.11
 - pandas, numpy
 - scikit-learn
+- imbalanced-learn (SMOTE, Pipeline)
+- xgboost, lightgbm
 - seaborn, matplotlib
 - Streamlit *(coming soon)*
 
@@ -69,11 +100,12 @@ Planned pages:
 
 ```
 FIFA-FeatureScope/
-├── players_22.csv               # Raw dataset (not tracked)
-├── players_22_clean.csv         # Cleaned dataset
-├── data_cleaning.ipynb          # Cleaning notebook
-├── feature_selection.ipynb      # Full pipeline notebook
-├── FIFA_FeatureScope_Pipeline.md # Detailed pipeline explanation
+├── players_22.csv                # Raw dataset (not tracked)
+├── players_22_clean.csv          # Cleaned dataset
+├── fifa_model_ready.csv          # Final 20 features + target (model input)
+├── data_cleaning.ipynb           # Cleaning + feature selection notebook
+├── Gradient_Boosting.ipynb       # XGBoost & LightGBM modeling notebook
+├── FIFA_FeatureScope_Pipeline.md # Detailed pipeline + modeling explanation
 └── README.md
 ```
 
