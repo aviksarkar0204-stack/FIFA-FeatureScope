@@ -1,10 +1,10 @@
-# FIFA FeatureScope — Feature Selection Pipeline
+# FIFA FeatureScope — Feature Selection + Modeling Pipeline
 
 ## Project Overview
 
 **Dataset:** FIFA 22 Players (`players_22.csv`) — 19,239 players, 110 raw columns  
 **Goal:** Predict player position (14 classes: CB, ST, CM, CDM, LB, RB, CAM, RM, LM, RW, LW, RWB, LWB, CF)  
-**Method:** Apply all 5 feature selection techniques in a progressive pipeline
+**Method:** Apply all 5 feature selection techniques in a progressive pipeline, then model with XGBoost and LightGBM
 
 ---
 
@@ -213,7 +213,209 @@ Dropped: 0
 
 ---
 
-## Key Learnings
+---
+
+# Modeling Phase — XGBoost & LightGBM
+
+## Setup
+
+The 20 selected features were saved to `fifa_model_ready.csv` with the target column `position` (string labels). In the modeling notebook, `LabelEncoder` was applied to encode positions as integers before training.
+
+**Train/Test Split:**
+```
+Strategy: Stratified (stratify=y)
+Reason: 14 position classes with heavy imbalance — stratification ensures
+        proportional class representation in both train and test sets
+Test size: 20%
+X_train: (12816, 20) | X_test: (3204, 20)
+```
+
+---
+
+## Class Imbalance Problem
+
+After the first XGBoost baseline run, three positions were completely ignored:
+
+| Position | Support | F1 Score |
+|---|---|---|
+| CF (Centre Forward) | 26 | 0.00 |
+| LWB (Left Wing Back) | 33 | 0.00 |
+| RWB (Right Wing Back) | 34 | 0.00 |
+
+**Root cause:** These are rare positions in real football — very few players occupy them, so the dataset naturally has very few samples. XGBoost ignores them because predicting majority classes gives better overall accuracy.
+
+**Why Macro F1 is the correct metric here:** Accuracy is dominated by large classes (CB: 628, ST: 472). Macro F1 weights every class equally regardless of size, making it the honest measure for this imbalanced multiclass problem.
+
+---
+
+## Experiment 1 — XGBoost Baseline
+
+```python
+XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=6,
+              eval_metric='mlogloss', random_state=42)
+```
+
+| Metric | Score |
+|---|---|
+| Accuracy | 0.688 |
+| Macro F1 | 0.44 |
+
+CF, LWB, RWB → all 0.00 F1. Model completely ignores minority classes.
+
+---
+
+## Experiment 2 — XGBoost + SMOTE
+
+SMOTE (Synthetic Minority Oversampling Technique) applied **only on training data** to avoid data leakage. Synthetic samples generated for minority classes to balance the distribution.
+
+**Critical rule:** SMOTE must be applied after the train/test split, never before. Applying it before would let synthetic samples derived from the test distribution bleed into training, making evaluation unreliable.
+
+```python
+smote = SMOTE(random_state=42)
+X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+```
+
+| Metric | Score |
+|---|---|
+| Accuracy | 0.651 |
+| Macro F1 | 0.45 |
+
+Accuracy dropped but Macro F1 improved — CF, LWB, RWB now get non-zero scores. This is the correct trade-off: the model became more fair across all classes even though raw accuracy fell.
+
+---
+
+## Experiment 3 — XGBoost + SMOTE + RandomizedSearchCV
+
+```python
+param_dist = {
+    'n_estimators': [100, 200, 300],
+    'learning_rate': [0.01, 0.05, 0.1],
+    'max_depth': [4, 6, 8]
+}
+# Best params found: n_estimators=200, max_depth=8, learning_rate=0.1
+```
+
+| Metric | Score |
+|---|---|
+| Accuracy | 0.668 |
+| Macro F1 | 0.45 |
+
+Tuning recovered some accuracy but Macro F1 stayed flat. The bottleneck is not the model or hyperparameters — it's the data. CF, LWB, RWB simply don't have enough samples for tuning to fix.
+
+---
+
+## Experiment 4 — LightGBM + class_weight='balanced'
+
+Instead of SMOTE, LightGBM's built-in `class_weight='balanced'` was used. This tells the model to internally assign higher loss penalties to minority class errors — different mechanism, same goal as SMOTE.
+
+```python
+LGBMClassifier(class_weight='balanced', random_state=42, verbose=-1)
+# Best params: n_estimators=300, max_depth=4, learning_rate=0.05
+```
+
+| Metric | Score |
+|---|---|
+| Accuracy | 0.664 |
+| Macro F1 | **0.46** |
+
+Best Macro F1 so far. RWB improved from 0.00 to 0.15.
+
+---
+
+## Experiment 5 — LightGBM + SMOTE (Leaky — Incorrect)
+
+SMOTE applied outside CV loop, then LightGBM trained on resampled data with `RandomizedSearchCV`. This produced a misleadingly high CV score:
+
+```
+CV Macro F1:   0.914  ← inflated (leaky)
+Test Macro F1: 0.45   ← real performance
+```
+
+**Why this happened:** SMOTE creates synthetic samples very similar to existing ones. When CV runs on pre-resampled data, validation folds contain synthetic samples nearly identical to training samples. The model appears to generalize well but it's actually memorizing the synthetic data. This is a data leakage problem.
+
+---
+
+## Experiment 6 — LightGBM + SMOTE Pipeline (Correct)
+
+The correct approach: SMOTE applied **inside each CV fold** using `imblearn.Pipeline`. This ensures synthetic samples never appear in validation folds.
+
+```python
+from imblearn.pipeline import Pipeline
+
+pipeline = Pipeline([
+    ('smote', SMOTE(random_state=42)),
+    ('model', LGBMClassifier(random_state=42, verbose=-1))
+])
+
+param_dist = {
+    'model__n_estimators': [100, 200, 300],
+    'model__learning_rate': [0.01, 0.05, 0.1],
+    'model__max_depth': [4, 6, 8]
+}
+# Best params: n_estimators=100, max_depth=8, learning_rate=0.05
+```
+
+Now CV score and test score are consistent — no leakage:
+
+```
+CV Macro F1:   0.458  ← honest
+Test Macro F1: 0.46   ← real performance
+```
+
+| Metric | Score |
+|---|---|
+| Accuracy | 0.663 |
+| Macro F1 | **0.46** |
+
+---
+
+## Final Model Comparison
+
+| Run | Accuracy | Macro F1 | Notes |
+|---|---|---|---|
+| XGBoost Baseline | 0.688 | 0.44 | CF/LWB/RWB ignored |
+| XGBoost + SMOTE | 0.651 | 0.45 | Minority classes recognized |
+| XGBoost + SMOTE + Tuning | 0.668 | 0.45 | Marginal gain from tuning |
+| LightGBM + class_weight | 0.664 | **0.46** | Best — clean approach |
+| LightGBM + SMOTE (leaky) | 0.667 | 0.45 | Inflated CV — not trustworthy |
+| LightGBM + SMOTE Pipeline | 0.663 | **0.46** | Best — correct approach |
+
+**Winner:** LightGBM with either `class_weight='balanced'` or the correct SMOTE Pipeline — both achieve Macro F1 of 0.46 with honest evaluation.
+
+---
+
+## Confusion Matrix Observations
+
+The confusion matrix revealed that model errors are not random — they follow positional logic:
+
+- **LWB ↔ LB** — most LWB players misclassified as LB (very similar roles)
+- **RWB ↔ RB** — same pattern on the right side
+- **LW / LM / RM / RW** — frequent confusion among each other (tactically interchangeable)
+- **CB, ST, GK** — very clean predictions (distinctive profiles)
+
+This is a **domain knowledge problem** as much as a modeling problem. Even human scouts sometimes debate whether a player is a LM or LW.
+
+---
+
+## Key Learnings from Modeling Phase
+
+1. **Accuracy is misleading for imbalanced multiclass problems** — always use Macro F1 as primary metric when classes have very different sizes.
+
+2. **SMOTE must be applied inside the CV loop** — applying it before CV creates data leakage, inflating CV scores dramatically (0.91 vs real 0.45 in this experiment). Use `imblearn.Pipeline` to handle this correctly.
+
+3. **There is a data ceiling** — all approaches plateau around 0.46 Macro F1. Beyond a certain point, no algorithm or technique can compensate for genuinely insufficient data in minority classes.
+
+4. **`class_weight='balanced'` vs SMOTE** — both solve the same imbalance problem through different mechanisms. `class_weight` adjusts loss weights internally; SMOTE creates synthetic samples externally. Performance is similar when both are applied correctly.
+
+5. **XGBoost vs LightGBM** — LightGBM edges out XGBoost slightly (0.46 vs 0.45) on this dataset, and is significantly faster to train. For tabular classification, LightGBM is generally preferred in production.
+
+6. **RandomizedSearchCV over GridSearchCV** — for large param spaces with expensive models, RandomizedSearchCV samples a random subset of combinations. Much faster, usually finds equally good or better results.
+
+7. **Confusion matrix tells more than accuracy** — the confusion matrix revealed systematic positional confusion (LWB/LB, RWB/RB) that accuracy alone would never surface.
+
+---
+
+## Key Learnings from Feature Selection Phase
 
 1. **Not all methods will always drop features** — VarianceThreshold dropped nothing on numerical features because FIFA data is naturally varied. That is a valid result, not a failure.
 
